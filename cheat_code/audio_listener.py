@@ -18,6 +18,19 @@ PERF PARAMS:
   - non_speaking_duration    : 0.4 s  (tighter silence end detection)
   - SILENCE_SECONDS          : 1.0 s  (system audio flushes quickly after pause)
   - CHUNK_FRAMES             : 512    (smaller chunks = faster energy detection)
+
+FIX (this version):
+  - Every place that used to do `except Exception: return None` (or pass)
+    now also calls logging.error(...). main.py already configures
+    logging to write to crash.log next to the exe, so real failures on a
+    different PC (SSL/cert issues, missing soundcard backend, etc.) will
+    actually show up there instead of disappearing completely.
+  - SystemAudioListener now has a silence watchdog: if the resolved
+    "default speaker" device produces no audio above a tiny noise floor
+    for SILENCE_WARN_SECONDS, it emits a one-time on-screen warning
+    telling the user the wrong output device is probably being captured
+    (very common cause of "active... listening..." then nothing, when
+    the meeting app outputs to a different device than Windows default).
 """
 
 import queue
@@ -26,6 +39,7 @@ import time
 import io
 import wave
 import audioop
+import logging
 import numpy as np
 import speech_recognition as sr
 
@@ -60,7 +74,10 @@ def _transcribe_with_groq(wav_bytes: bytes, api_key: str, language: str = "en") 
         # response_format="text" returns a plain string
         text = result.strip() if isinstance(result, str) else (result.text or "").strip()
         return text or None
-    except Exception:
+    except Exception as e:
+        # Previously: except Exception: return None  (silent — invisible on a
+        # different PC). Now logged so crash.log shows the real cause.
+        logging.error("Groq Whisper transcription failed: %s", e, exc_info=True)
         return None
 
 
@@ -72,7 +89,8 @@ def _transcribe_with_google(wav_bytes: bytes, recognizer: sr.Recognizer) -> str 
         return text.strip() if text else None
     except sr.UnknownValueError:
         return None
-    except Exception:
+    except Exception as e:
+        logging.error("Google STT fallback failed: %s", e, exc_info=True)
         return None
 
 
@@ -111,8 +129,8 @@ class AudioListener:
                 with mic as source:
                     pass
                 return mic
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("Mic device_index=%s init failed: %s", self.device_index, e, exc_info=True)
         return sr.Microphone()
 
     @property
@@ -137,8 +155,8 @@ class AudioListener:
         try:
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=1.5)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("Mic calibration failed: %s", e, exc_info=True)
 
     def _listen_loop(self):
         self._calibrate()
@@ -161,11 +179,13 @@ class AudioListener:
                 consecutive_errors = 0
             except OSError as e:
                 consecutive_errors += 1
+                logging.error("Microphone OS error: %s", e, exc_info=True)
                 if self._running and self.on_text:
                     self.on_text(f"[AUDIO ERROR] Microphone error: {e}")
                 time.sleep(min(2 * consecutive_errors, 10))
             except Exception as e:
                 consecutive_errors += 1
+                logging.error("Mic listen loop error: %s", e, exc_info=True)
                 if self._running and self.on_text:
                     self.on_text(f"[AUDIO ERROR] {str(e)}")
                 time.sleep(1)
@@ -209,7 +229,8 @@ class AudioListener:
         try:
             names = sr.Microphone.list_microphone_names()
             return list(enumerate(names))
-        except Exception:
+        except Exception as e:
+            logging.error("list_devices failed: %s", e, exc_info=True)
             return []
 
     @staticmethod
@@ -221,8 +242,8 @@ class AudioListener:
             for i, name in enumerate(names):
                 if any(kw in name.lower() for kw in keywords):
                     return i
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("find_loopback_device failed: %s", e, exc_info=True)
         return None
 
 
@@ -252,6 +273,12 @@ class SystemAudioListener:
     SILENCE_SECONDS  = 1.0        # flush 0.8 s sooner than original 1.8 s
     MIN_SPEECH_SECS  = 0.4
     TARGET_RMS       = 4000
+
+    # ── Silent-device watchdog ──────────────────────────────────────────────
+    # If the loopback device never produces even faint signal, it's almost
+    # always capturing the wrong output device, not "no one is talking yet".
+    SILENCE_FLOOR        = 15    # anything above this counts as "some signal"
+    SILENCE_WARN_SECONDS = 10    # warn once if nothing crosses the floor this long
 
     def __init__(self, on_text_callback=None, device_index=None):
         self.on_text    = on_text_callback
@@ -328,8 +355,8 @@ class SystemAudioListener:
                 all_spk = sc.all_speakers()
                 if 0 <= self._dev_index < len(all_spk):
                     return all_spk[self._dev_index]
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("Speaker resolve by index=%s failed: %s", self._dev_index, e, exc_info=True)
         return sc.default_speaker()
 
     # ── Main capture loop ─────────────────────────────────────────────────────
@@ -340,12 +367,13 @@ class SystemAudioListener:
             import pythoncom
             pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
             com_initialized = True
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("pythoncom CoInitializeEx failed: %s", e, exc_info=True)
 
         try:
             import soundcard as sc
-        except ImportError:
+        except ImportError as e:
+            logging.error("soundcard import failed (PyInstaller packaging issue?): %s", e, exc_info=True)
             if self.on_text:
                 self.on_text(
                     "[AUDIO ERROR] soundcard not installed.\n"
@@ -377,6 +405,11 @@ class SystemAudioListener:
                     self.SAMPLE_RATE / self.CHUNK_FRAMES * self.MIN_SPEECH_SECS
                 )
 
+                # Watchdog state for this capture session
+                loop_started_at = time.time()
+                last_audio_at   = loop_started_at
+                silence_warned  = False
+
                 with loopback_mic.recorder(
                     samplerate=self.SAMPLE_RATE,
                     channels=self.CHANNELS
@@ -389,6 +422,25 @@ class SystemAudioListener:
                             energy = audioop.rms(pcm, self.FORMAT_WIDTH)
                         except Exception:
                             energy = 0
+
+                        now = time.time()
+                        if energy > self.SILENCE_FLOOR:
+                            last_audio_at = now
+                        elif (not silence_warned
+                              and now - loop_started_at > self.SILENCE_WARN_SECONDS
+                              and now - last_audio_at > self.SILENCE_WARN_SECONDS):
+                            silence_warned = True
+                            if self.on_text:
+                                self.on_text(
+                                    f"⚠️ No sound detected from "
+                                    f"\"{speaker.name[:40]}\" in "
+                                    f"{int(self.SILENCE_WARN_SECONDS)}s.\n"
+                                    f"Your meeting app is probably outputting "
+                                    f"audio to a different device than Windows "
+                                    f"default.\nTray menu → 🎛️ Select Audio "
+                                    f"Device — pick the one actually playing "
+                                    f"the interviewer's voice."
+                                )
 
                         if energy > self.ENERGY_THRESHOLD:
                             speaking      = True
@@ -418,6 +470,7 @@ class SystemAudioListener:
 
             except Exception as e:
                 consecutive_errors += 1
+                logging.error("System audio capture error: %s", e, exc_info=True)
                 if self._running and self.on_text:
                     self.on_text(f"[AUDIO ERROR] System audio: {e}")
                 time.sleep(min(2 * consecutive_errors, 10))
@@ -426,8 +479,8 @@ class SystemAudioListener:
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("pythoncom CoUninitialize failed: %s", e, exc_info=True)
 
     # ── Async transcription worker ────────────────────────────────────────────
 
@@ -465,10 +518,12 @@ class SystemAudioListener:
         except sr.UnknownValueError:
             return None
         except sr.RequestError as e:
+            logging.error("Google STT request error: %s", e, exc_info=True)
             if self.on_text:
                 self.on_text(f"[AUDIO ERROR] Speech API: {e}")
             return None
         except Exception as e:
+            logging.error("Transcription error: %s", e, exc_info=True)
             if self.on_text:
                 self.on_text(f"[AUDIO ERROR] Transcription: {e}")
             return None
@@ -481,7 +536,8 @@ class SystemAudioListener:
             import soundcard  # noqa
             import numpy      # noqa
             return True
-        except ImportError:
+        except ImportError as e:
+            logging.error("SystemAudioListener.is_available() import check failed: %s", e, exc_info=True)
             return False
 
     @staticmethod
@@ -491,8 +547,8 @@ class SystemAudioListener:
             import pythoncom
             pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
             com_initialized = True
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("pythoncom CoInitializeEx (list_system_devices) failed: %s", e, exc_info=True)
 
         devices = []
         try:
@@ -500,20 +556,20 @@ class SystemAudioListener:
             default_name = ""
             try:
                 default_name = sc.default_speaker().name
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("default_speaker() failed: %s", e, exc_info=True)
             for i, speaker in enumerate(sc.all_speakers()):
                 name       = speaker.name or f"Speaker {i}"
                 is_default = (name == default_name)
                 devices.append((i, name, is_default, 48000))
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error("list_system_devices failed: %s", e, exc_info=True)
 
         if com_initialized:
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("pythoncom CoUninitialize (list_system_devices) failed: %s", e, exc_info=True)
 
         return devices
