@@ -355,39 +355,32 @@ class MeetingAssistant:
         self.signals.stream_token.connect(self.overlay.stream_append)
         self.signals.stream_done.connect(self.overlay.stream_finish)
 
-        # NEW — wire up language, resume, font-size signals
-        self.overlay.language_changed.connect(self._on_language_changed)
-        self.overlay.resume_changed.connect(self._on_resume_changed)
-        self.overlay.font_size_changed.connect(self._on_font_size_changed)
-
-        # Mic listener
-        self.mic_listener = AudioListener(on_text_callback=self._on_mic_text)
         self.signals.audio_text.connect(self._handle_audio_text)
 
-        # System audio listener
+        self.mic_listener    = AudioListener(on_text_callback=self._on_mic_text)
         self.system_listener = SystemAudioListener(
-            on_text_callback=self._on_sys_text,
-            device_index=self._sys_dev_index
+            on_text_callback=self._on_sys_text, device_index=self._sys_dev_index
         )
 
-        # Auto-scan
-        self.auto_scan_active = False
-        self.auto_scan_timer  = QTimer()
+        self.auto_scan_timer = QTimer()
         self.auto_scan_timer.timeout.connect(self._auto_scan)
+        self.auto_scan_active = False
 
-        self._register_hotkeys()
+        self.overlay.font_size_changed.connect(self._on_font_size_changed)
+        self.overlay.language_changed.connect(self._on_language_changed)
+        self.overlay.resume_changed.connect(self._on_resume_changed)
+
         self._build_tray()
+        self._register_hotkeys()
 
-    # ── NEW: language / resume / font callbacks ───────────────────────────────
+    def _on_language_changed(self, lang: str):
+        self.current_language = lang
+        cfg = load_config(); cfg["language"] = lang; save_config(cfg)
 
-    def _on_language_changed(self, language: str):
-        self.current_language = language
-        cfg = load_config(); cfg["language"] = language; save_config(cfg)
-
-    def _on_resume_changed(self, resume_text: str):
-        self.resume_text = resume_text
-        cfg = load_config(); cfg["resume_text"] = resume_text; save_config(cfg)
-        word_count = len(resume_text.split()) if resume_text.strip() else 0
+    def _on_resume_changed(self, text: str):
+        self.resume_text = text
+        cfg = load_config(); cfg["resume_text"] = text; save_config(cfg)
+        word_count = len(text.split())
         self.tray.showMessage(
             "Resume Saved",
             f"Resume saved ({word_count} words). AI will now use it for experience questions.",
@@ -627,6 +620,13 @@ class MeetingAssistant:
         if text.startswith("[AUDIO ERROR]"):
             self.signals.show_status.emit(text); return
         if text.startswith("🔊"):
+            self.signals.show_status.emit(text); return
+        if text.startswith("⚠️"):
+            # FIX: the new silence-watchdog warning from SystemAudioListener
+            # starts with this prefix. Without this branch it would fall
+            # through to is_question() and either get silently dropped or,
+            # worse, mistakenly sent to the solver as if it were something
+            # the interviewer said.
             self.signals.show_status.emit(text); return
         if is_question(text):
             preview = text[:70] + ("..." if len(text) > 70 else "")
